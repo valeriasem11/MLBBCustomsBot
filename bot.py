@@ -73,6 +73,26 @@ REMINDER_BEFORE_MINUTES = 15
 # Второе напоминание (только тем, кто ещё не подтвердил участие)
 SECOND_REMINDER_BEFORE_MINUTES = 5
 
+# За сколько часов до старта регулярной (по расписанию) кастомки бот сам
+# открывает регистрацию. День/время в /addschedule — это время СТАРТА игры.
+SCHEDULE_ANNOUNCE_BEFORE_HOURS = 2
+
+WEEKDAY_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+
+WEEKDAY_ALIASES = {
+    "понедельник": 0, "пн": 0,
+    "вторник": 1, "вт": 1,
+    "среда": 2, "ср": 2,
+    "четверг": 3, "чт": 3,
+    "пятница": 4, "пт": 4,
+    "суббота": 5, "сб": 5,
+    "воскресенье": 6, "вс": 6,
+}
+
+
+def parse_weekday(text: str):
+    return WEEKDAY_ALIASES.get(text.strip().lower())
+
 # =========================================================================
 
 # Все времена кастомок считаются и хранятся по московскому времени —
@@ -194,6 +214,9 @@ ADMIN_COMMANDS = PLAYER_COMMANDS + [
     BotCommand(command="renameteam", description="Переименовать команду"),
     BotCommand(command="setresult", description="Указать победителя и MVP"),
     BotCommand(command="cancelcustom", description="Отменить кастомку"),
+    BotCommand(command="addschedule", description="Добавить регулярное расписание"),
+    BotCommand(command="listschedules", description="Показать регулярное расписание"),
+    BotCommand(command="removeschedule", description="Убрать расписание"),
     BotCommand(command="addbotadmin", description="Добавить админа бота (Reply, только создатель)"),
     BotCommand(command="removebotadmin", description="Убрать админа бота (Reply, только создатель)"),
     BotCommand(command="listbotadmins", description="Кто может управлять ботом"),
@@ -317,6 +340,16 @@ def init_db():
             team_number INTEGER,
             name TEXT,
             PRIMARY KEY (custom_id, team_number)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            weekday INTEGER,
+            time TEXT,
+            created_by INTEGER,
+            last_triggered_date TEXT
         )
     """)
     conn.commit()
@@ -565,6 +598,57 @@ def set_custom_winner(custom_id: int, team_number: int):
 def set_custom_mvp(custom_id: int, user_id: int):
     conn = db()
     conn.execute("UPDATE customs SET mvp_user_id = ? WHERE id = ?", (user_id, custom_id))
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------ Регулярное расписание кастомок ------------------------------
+
+def add_schedule(chat_id: int, weekday: int, time_str: str, created_by: int) -> int:
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO schedules (chat_id, weekday, time, created_by, last_triggered_date) "
+        "VALUES (?, ?, ?, ?, NULL)",
+        (chat_id, weekday, time_str, created_by)
+    )
+    conn.commit()
+    schedule_id = cur.lastrowid
+    conn.close()
+    return schedule_id
+
+
+def get_schedules(chat_id: int):
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM schedules WHERE chat_id = ? ORDER BY weekday, time",
+        (chat_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_schedules():
+    conn = db()
+    rows = conn.execute("SELECT * FROM schedules").fetchall()
+    conn.close()
+    return rows
+
+
+def remove_schedule(schedule_id: int, chat_id: int) -> bool:
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM schedules WHERE id = ? AND chat_id = ?",
+        (schedule_id, chat_id)
+    )
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
+
+
+def mark_schedule_triggered(schedule_id: int, date_str: str):
+    conn = db()
+    conn.execute("UPDATE schedules SET last_triggered_date = ? WHERE id = ?", (date_str, schedule_id))
     conn.commit()
     conn.close()
 
@@ -1541,6 +1625,78 @@ async def edit_custom_time_save(message: Message, state: FSMContext):
     await message.reply(text_msg, reply_markup=register_button(custom_id))
 
 
+# ------------------------------ Регулярное расписание (только админы) ------------------------------
+
+@router.message(Command("addschedule"))
+async def cmd_add_schedule(message: Message):
+    if not await is_admin(message.from_user.id, message.chat.id):
+        await message.reply("Эта команда только для админов.")
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "Использование: /addschedule День ЧЧ:ММ\n"
+            "Например: /addschedule Пятница 21:00\n\n"
+            "День — это время СТАРТА игры. Бот сам откроет регистрацию "
+            f"заранее, за {SCHEDULE_ANNOUNCE_BEFORE_HOURS} ч. до этого времени."
+        )
+        return
+
+    weekday = parse_weekday(parts[1])
+    if weekday is None:
+        await message.reply(
+            "Не понял день недели 🙈\nНапиши, например: Понедельник, Вторник, ... Воскресенье (или сокращённо: Пн, Вт...)."
+        )
+        return
+
+    try:
+        datetime.strptime(parts[2].strip(), "%H:%M")
+    except ValueError:
+        await message.reply("Не понял время 🙈\nНапиши в формате ЧЧ:ММ, например 21:00.")
+        return
+
+    add_schedule(message.chat.id, weekday, parts[2].strip(), message.from_user.id)
+    await message.reply(
+        f"Готово ✅ Каждую(ый) {WEEKDAY_NAMES[weekday]} в {parts[2].strip()} (старт игры) "
+        f"бот будет сам открывать регистрацию на кастомку "
+        f"(за {SCHEDULE_ANNOUNCE_BEFORE_HOURS} ч. до этого времени), "
+        f"если в этот момент нет другой активной кастомки."
+    )
+
+
+@router.message(Command("listschedules"))
+async def cmd_list_schedules(message: Message):
+    schedules = get_schedules(message.chat.id)
+    if not schedules:
+        await message.reply("В этой беседе пока нет ни одного регулярного расписания.")
+        return
+
+    lines = ["🗓 <b>Регулярное расписание</b>\n"]
+    for s in schedules:
+        lines.append(f"ID {s['id']}: {WEEKDAY_NAMES[s['weekday']]}, {s['time']} (старт игры)")
+    lines.append("\nУбрать расписание: /removeschedule ID")
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("removeschedule"))
+async def cmd_remove_schedule(message: Message):
+    if not await is_admin(message.from_user.id, message.chat.id):
+        await message.reply("Эта команда только для админов.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.reply("Использование: /removeschedule ID\nПосмотреть ID можно командой /listschedules.")
+        return
+
+    schedule_id = int(parts[1].strip())
+    if remove_schedule(schedule_id, message.chat.id):
+        await message.reply("Расписание удалено ✅")
+    else:
+        await message.reply("Расписание с таким ID в этой беседе не найдено.")
+
+
 @router.message(Command("active"))
 async def cmd_active(message: Message):
     custom = get_active_custom(message.chat.id)
@@ -2079,6 +2235,42 @@ async def cb_reset_stats(callback: CallbackQuery):
 async def scheduler_loop():
     while True:
         now = now_msk()
+
+        # --- Регулярное расписание: сама открывает регистрацию заранее ---
+        for sched in get_all_schedules():
+            try:
+                if now.weekday() != sched["weekday"]:
+                    continue
+
+                sched_time = datetime.strptime(sched["time"], "%H:%M").time()
+                start_dt = datetime.combine(now.date(), sched_time, tzinfo=MOSCOW_TZ)
+                open_dt = start_dt - timedelta(hours=SCHEDULE_ANNOUNCE_BEFORE_HOURS)
+                today_str = now.date().isoformat()
+
+                if sched["last_triggered_date"] == today_str:
+                    continue  # сегодня уже обработано это расписание
+                if not (open_dt <= now < start_dt):
+                    continue  # ещё не время (или уже прошло) открывать регистрацию
+
+                mark_schedule_triggered(sched["id"], today_str)
+
+                if get_active_custom(sched["chat_id"]):
+                    continue  # уже есть активная кастомка — пропускаем в этот раз, как договорились
+
+                custom_id = create_custom(sched["chat_id"], start_dt)
+                text_msg = (
+                    f"🎮 <b>Открыта регистрация на кастомку!</b> (по расписанию)\n\n"
+                    f"🕒 Начало: {start_dt.strftime('%d.%m.%Y %H:%M')} по МСК\n\n"
+                    f"Нажми на кнопку ниже, чтобы записаться.\n"
+                    f"Если у тебя ещё нет профиля — сначала напиши боту в личные сообщения /start"
+                )
+                await bot.send_message(
+                    sched["chat_id"], text_msg,
+                    reply_markup=register_button(custom_id), parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"[scheduler_loop] Ошибка при обработке расписания {sched['id']}: {e}")
+
         for custom in get_all_active_customs():
             try:
                 event_time = parse_stored_time(custom["event_time"])
