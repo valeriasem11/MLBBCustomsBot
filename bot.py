@@ -2546,7 +2546,7 @@ async def cmd_random_hero(message: Message):
     emoji = HERO_CLASS_EMOJI[hero_class]
 
     await message.reply(
-        f"🎲 {user_mention_html(message.from_user)}, тебе выпал:\n\n{emoji} {hero}",
+        f"🎲 {user_mention_html(message.from_user)}, тебе выпал герой:\n\n{emoji} {hero}",
         parse_mode="HTML"
     )
 
