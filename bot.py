@@ -55,6 +55,16 @@ ROLES = ["Боец", "Лес", "Маг", "Стрелок", "Роум", "Гене
 
 RANKS = ["Эпик", "Легенда", "Мифик", "Мифическая честь", "Мифическая слава", "100+ звёзд"]
 
+# Пул случайных названий для команд — присваиваются автоматически при
+# формировании (/maketeams). Можно свободно менять/дополнять список.
+TEAM_NAMES_POOL = [
+    "Дикие вепри", "Ночные фениксы", "Стальные драконы", "Тихие убийцы",
+    "Королевские кобры", "Бешеные панды", "Ледяные волки", "Огненные скорпионы",
+    "Теневые ястребы", "Громовые тигры", "Кровавые вороны", "Штормовые акулы",
+    "Голодные крабы", "Пьяные единороги", "Свирепые еноты", "Космические хомяки",
+    "Отбитые русалки", "Токсичные утки", "Безумные гуси", "Огненные ленивцы",
+]
+
 DB_PATH = "data/mlbb_bot.db"
 
 # Как заранее присылать напоминание до старта кастомки
@@ -181,6 +191,7 @@ ADMIN_COMMANDS = PLAYER_COMMANDS + [
     BotCommand(command="list", description="Список зарегистрированных"),
     BotCommand(command="removeplayer", description="Удалить участника из кастомки"),
     BotCommand(command="maketeams", description="Разбить игроков на команды"),
+    BotCommand(command="renameteam", description="Переименовать команду"),
     BotCommand(command="setresult", description="Указать победителя и MVP"),
     BotCommand(command="cancelcustom", description="Отменить кастомку"),
     BotCommand(command="addbotadmin", description="Добавить админа бота (Reply, только создатель)"),
@@ -298,6 +309,14 @@ def init_db():
             chat_id INTEGER,
             user_id INTEGER,
             PRIMARY KEY (chat_id, user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS team_names (
+            custom_id INTEGER,
+            team_number INTEGER,
+            name TEXT,
+            PRIMARY KEY (custom_id, team_number)
         )
     """)
     conn.commit()
@@ -579,6 +598,10 @@ def reset_chat_stats(chat_id: int):
     """
     conn = db()
     conn.execute("""
+        DELETE FROM team_names
+        WHERE custom_id IN (SELECT id FROM customs WHERE chat_id = ? AND status = 'finished')
+    """, (chat_id,))
+    conn.execute("""
         DELETE FROM registrations
         WHERE custom_id IN (SELECT id FROM customs WHERE chat_id = ? AND status = 'finished')
     """, (chat_id,))
@@ -653,6 +676,49 @@ def clear_teams(custom_id: int):
     conn.close()
 
 
+def set_team_name(custom_id: int, team_number: int, name: str):
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO team_names (custom_id, team_number, name) VALUES (?, ?, ?)",
+        (custom_id, team_number, name)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_team_names(custom_id: int) -> dict:
+    conn = db()
+    rows = conn.execute(
+        "SELECT team_number, name FROM team_names WHERE custom_id = ?",
+        (custom_id,)
+    ).fetchall()
+    conn.close()
+    return {r["team_number"]: r["name"] for r in rows}
+
+
+def get_team_display_name(custom_id: int, team_number: int) -> str:
+    names = get_team_names(custom_id)
+    return names.get(team_number) or f"Команда {team_number}"
+
+
+def clear_team_names(custom_id: int):
+    conn = db()
+    conn.execute("DELETE FROM team_names WHERE custom_id = ?", (custom_id,))
+    conn.commit()
+    conn.close()
+
+
+def assign_random_team_names(custom_id: int, num_teams: int):
+    pool = TEAM_NAMES_POOL[:]
+    random.shuffle(pool)
+    for team_number in range(1, num_teams + 1):
+        if team_number - 1 < len(pool):
+            name = pool[team_number - 1]
+        else:
+            name = f"Команда {team_number}"  # если названий в пуле не хватило
+        set_team_name(custom_id, team_number, name)
+
+
 def swap_players_teams(custom_id: int, user_id_1: int, user_id_2: int):
     """Меняет местами двух игроков между их текущими командами."""
     conn = db()
@@ -716,6 +782,7 @@ def make_teams(custom_id: int, num_teams: int = None) -> int:
         num_teams = total // 5  # только полные команды по 5, остальное — в запас
 
     clear_teams(custom_id)
+    clear_team_names(custom_id)
 
     if num_teams == 0:
         return 0
@@ -804,6 +871,8 @@ def make_teams(custom_id: int, num_teams: int = None) -> int:
             clean_role = role.split(" (")[0]
             set_team_number(custom_id, p["user_id"], team_number, team_role=clean_role)
 
+    assign_random_team_names(custom_id, num_teams)
+
     return num_teams
 
 
@@ -891,7 +960,10 @@ def attendance_icon(value) -> str:
 def winner_pick_keyboard(custom_id: int) -> InlineKeyboardMarkup:
     teams, _ = get_teams_grouped(custom_id)
     buttons = [
-        [InlineKeyboardButton(text=f"Команда {n}", callback_data=f"result:team:{custom_id}:{n}")]
+        [InlineKeyboardButton(
+            text=get_team_display_name(custom_id, n),
+            callback_data=f"result:team:{custom_id}:{n}"
+        )]
         for n in sorted(teams.keys())
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -933,7 +1005,7 @@ def teams_player_picker_keyboard(custom_id: int, exclude_uid: int = None, first_
     def add_button(p):
         if p["user_id"] == exclude_uid:
             return
-        label = f"Команда {p['team_number']}" if p["team_number"] else "Запасной"
+        label = get_team_display_name(custom_id, p["team_number"]) if p["team_number"] else "Запасной"
         text = f"{label} • {p['nickname']}"
         if first_uid is None:
             callback_data = f"teams:pick1sel:{p['user_id']}"
@@ -960,7 +1032,8 @@ def render_teams_text(custom_id: int) -> str:
 
     lines = ["🧩 <b>Команды</b>"]
     for team_number in sorted(teams.keys()):
-        lines.append(f"\n<b>Команда {team_number}</b>")
+        team_name = get_team_display_name(custom_id, team_number)
+        lines.append(f"\n<b>🏷 {team_name}</b>")
         for p in teams[team_number]:
             role_shown = p["team_role"] or p["role1"]
             lines.append(f"• {p['nickname']} — {role_shown} — {p['rank']}")
@@ -1633,6 +1706,45 @@ async def cmd_teams(message: Message):
     )
 
 
+@router.message(Command("renameteam"))
+async def cmd_rename_team(message: Message):
+    if not await is_admin(message.from_user.id, message.chat.id):
+        await message.reply("Эта команда только для админов.")
+        return
+
+    custom = get_active_custom(message.chat.id)
+    if not custom:
+        await message.reply("Активной кастомки в этой беседе сейчас нет.")
+        return
+
+    teams, _ = get_teams_grouped(custom["id"])
+    if not teams:
+        await message.reply("Команды ещё не сформированы (/maketeams).")
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        team_list = ", ".join(
+            f"{n} — {get_team_display_name(custom['id'], n)}" for n in sorted(teams.keys())
+        )
+        await message.reply(
+            f"Использование: /renameteam НОМЕР Новое название\n"
+            f"Например: /renameteam 1 Дикие тигры\n\n"
+            f"Текущие команды: {team_list}"
+        )
+        return
+
+    team_number = int(parts[1])
+    new_name = parts[2].strip()
+
+    if team_number not in teams:
+        await message.reply(f"Команды {team_number} не существует в текущем составе.")
+        return
+
+    set_team_name(custom["id"], team_number, new_name)
+    await message.reply(f"Готово ✅ Команда {team_number} теперь называется «{new_name}».")
+
+
 @router.callback_query(F.data == "teams:pick1")
 async def cb_teams_pick1(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id, callback.message.chat.id):
@@ -1810,9 +1922,10 @@ async def cb_result_team(callback: CallbackQuery):
     custom_id, team_number = int(custom_id), int(team_number)
 
     set_custom_winner(custom_id, team_number)
+    team_name = get_team_display_name(custom_id, team_number)
 
     await callback.message.edit_text(
-        f"Победила Команда {team_number} 🏆\n\nКто был MVP этой команды?",
+        f"Победила {team_name} 🏆\n\nКто был MVP этой команды?",
         reply_markup=mvp_pick_keyboard(custom_id, team_number)
     )
     await callback.answer()
@@ -1833,11 +1946,12 @@ async def cb_result_mvp(callback: CallbackQuery):
     mvp_user = get_user(user_id)
     teams, _ = get_teams_grouped(custom_id)
     winner_team = custom["winner_team"]
-    team_names = ", ".join(p["nickname"] for p in teams.get(winner_team, []))
+    winner_team_name = get_team_display_name(custom_id, winner_team)
+    team_members = ", ".join(p["nickname"] for p in teams.get(winner_team, []))
 
     result_text = (
         f"🏆 <b>Результаты кастомки</b>\n\n"
-        f"Победила <b>Команда {winner_team}</b>: {team_names}\n\n"
+        f"Победила <b>{winner_team_name}</b>: {team_members}\n\n"
         f"⭐ MVP: {mention(mvp_user)}"
     )
     await callback.message.edit_text(result_text, parse_mode="HTML")
@@ -1856,8 +1970,9 @@ async def cmd_history(message: Message):
         event_time = parse_stored_time(r["event_time"])
         mvp_user = get_user(r["mvp_user_id"]) if r["mvp_user_id"] else None
         mvp_name = mvp_user["nickname"] if mvp_user else "—"
+        winner_team_name = get_team_display_name(r["id"], r["winner_team"])
         lines.append(
-            f"🕒 {event_time.strftime('%d.%m.%Y %H:%M')} — Команда {r['winner_team']} 🏆, MVP: {mvp_name}"
+            f"🕒 {event_time.strftime('%d.%m.%Y %H:%M')} — {winner_team_name} 🏆, MVP: {mvp_name}"
         )
     await message.reply("\n".join(lines), parse_mode="HTML")
 
