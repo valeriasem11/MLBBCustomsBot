@@ -22,6 +22,7 @@ import os
 import random
 import sqlite3
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
@@ -48,13 +49,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # Обычно тут достаточно только твоего ID — все остальные, кто является
 # настоящим администратором конкретной беседы в Telegram, получают права
 # автоматически, без ручного добавления сюда.
-ADMIN_IDS = [828533150,5160566776]
+ADMIN_IDS = [828533150]
 
 ROLES = ["Боец", "Лес", "Маг", "Стрелок", "Роум", "Генералист"]
 
 RANKS = ["Эпик", "Легенда", "Мифик", "Мифическая честь", "Мифическая слава", "100+ звёзд"]
 
-DB_PATH = "mlbb_bot.db"
+DB_PATH = "data/mlbb_bot.db"
 
 # Как заранее присылать напоминание до старта кастомки
 REMINDER_BEFORE_MINUTES = 15
@@ -63,6 +64,28 @@ REMINDER_BEFORE_MINUTES = 15
 SECOND_REMINDER_BEFORE_MINUTES = 5
 
 # =========================================================================
+
+# Все времена кастомок считаются и хранятся по московскому времени —
+# независимо от того, в каком часовом поясе физически находится сервер,
+# на котором крутится бот (Амстердам, Москва, где угодно).
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def now_msk() -> datetime:
+    """Текущее время по Москве, независимо от часового пояса сервера."""
+    return datetime.now(MOSCOW_TZ)
+
+
+def parse_stored_time(iso_string: str) -> datetime:
+    """
+    Разбирает время, сохранённое в базе. Если время сохранено без
+    часового пояса (данные из старой версии бота, до этого исправления) —
+    считаем его московским, чтобы сравнения со временем не падали с ошибкой.
+    """
+    dt = datetime.fromisoformat(iso_string)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=MOSCOW_TZ)
+    return dt
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -149,6 +172,8 @@ PLAYER_COMMANDS = [
     BotCommand(command="active", description="Активная кастомка сейчас"),
     BotCommand(command="teams", description="Посмотреть команды"),
     BotCommand(command="history", description="Прошлые результаты кастомок"),
+    BotCommand(command="mystats", description="Моя статистика в этой беседе"),
+    BotCommand(command="leaderboard", description="Рейтинг беседы"),
 ]
 
 ADMIN_COMMANDS = PLAYER_COMMANDS + [
@@ -531,6 +556,50 @@ def get_results_history(chat_id: int, limit: int = 5):
         "ORDER BY id DESC LIMIT ?",
         (chat_id, limit)
     ).fetchall()
+    conn.close()
+    return rows
+
+
+# ------------------------------ Статистика и рейтинг ------------------------------
+# Статистика не хранится отдельно, а считается на лету из уже имеющихся
+# данных (кастомки, команды, результаты) — так она всегда точная и не
+# может "разъехаться" с реальной историей игр.
+
+def get_player_stats(chat_id: int, user_id: int):
+    conn = db()
+    row = conn.execute("""
+        SELECT
+            COUNT(*) AS games,
+            SUM(CASE WHEN c.winner_team = r.team_number THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN c.mvp_user_id = r.user_id THEN 1 ELSE 0 END) AS mvps
+        FROM registrations r
+        JOIN customs c ON c.id = r.custom_id
+        WHERE c.chat_id = ? AND c.status = 'finished'
+          AND r.team_number IS NOT NULL AND r.user_id = ?
+    """, (chat_id, user_id)).fetchone()
+    conn.close()
+    games = row["games"] or 0
+    wins = row["wins"] or 0
+    mvps = row["mvps"] or 0
+    return {"games": games, "wins": wins, "mvps": mvps}
+
+
+def get_leaderboard(chat_id: int, limit: int = 10):
+    conn = db()
+    rows = conn.execute("""
+        SELECT
+            u.user_id, u.nickname,
+            COUNT(*) AS games,
+            SUM(CASE WHEN c.winner_team = r.team_number THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN c.mvp_user_id = r.user_id THEN 1 ELSE 0 END) AS mvps
+        FROM registrations r
+        JOIN customs c ON c.id = r.custom_id
+        JOIN users u ON u.user_id = r.user_id
+        WHERE c.chat_id = ? AND c.status = 'finished' AND r.team_number IS NOT NULL
+        GROUP BY u.user_id
+        ORDER BY wins DESC, mvps DESC, games DESC
+        LIMIT ?
+    """, (chat_id, limit)).fetchall()
     conn.close()
     return rows
 
@@ -1265,18 +1334,19 @@ async def cmd_reset_bot_admins(message: Message):
 # ------------------------------ Создание кастомки (только админы) ------------------------------
 
 def parse_custom_time(text: str):
-    """Разбирает время из текста ('21:30' или '15.07.2026 21:30'). None, если формат неверный."""
+    """Разбирает время из текста ('21:30' или '15.07.2026 21:30'), считая его московским.
+    None, если формат неверный."""
     text = text.strip()
-    now = datetime.now()
+    now = now_msk()
     try:
         if len(text.split()) == 1:
             # только время -> сегодня (или завтра, если время уже прошло)
             t = datetime.strptime(text, "%H:%M").time()
-            event_time = datetime.combine(now.date(), t)
+            event_time = datetime.combine(now.date(), t, tzinfo=MOSCOW_TZ)
             if event_time < now:
                 event_time += timedelta(days=1)
         else:
-            event_time = datetime.strptime(text, "%d.%m.%Y %H:%M")
+            event_time = datetime.strptime(text, "%d.%m.%Y %H:%M").replace(tzinfo=MOSCOW_TZ)
         return event_time
     except ValueError:
         return None
@@ -1378,7 +1448,7 @@ async def cmd_active(message: Message):
         await message.reply("Сейчас в этой беседе нет активной кастомки.")
         return
 
-    event_time = datetime.fromisoformat(custom["event_time"])
+    event_time = parse_stored_time(custom["event_time"])
     players = get_registrations(custom["id"])
     await message.reply(
         f"🎮 Активная кастомка\n\n"
@@ -1422,10 +1492,10 @@ async def cmd_list(message: Message):
     lines = [f"📋 Зарегистрировано: {len(players)}\n(✅ подтвердил участие · ❌ не подтвердил · ⏳ ещё не спрашивали)\n"]
     for i, p in enumerate(players, start=1):
         lines.append(
-            f"{i}. {attendance_icon(p['attendance'])} {mention(p)} (ID: {p['game_id']}) — "
+            f"{i}. {attendance_icon(p['attendance'])} {p['nickname']} (ID: {p['game_id']}) — "
             f"{p['role1']}, {p['role2']} — {p['rank']}"
         )
-    await message.reply("\n".join(lines), parse_mode="HTML")
+    await message.reply("\n".join(lines))
 
 
 @router.message(Command("removeplayer"))
@@ -1639,8 +1709,8 @@ async def cb_unregister(callback: CallbackQuery):
         await callback.answer("Ты и не был(а) зарегистрирован(а) на эту кастомку.", show_alert=True)
         return
 
-    event_time = datetime.fromisoformat(custom["event_time"])
-    if event_time - datetime.now() < timedelta(minutes=30):
+    event_time = parse_stored_time(custom["event_time"])
+    if event_time - now_msk() < timedelta(minutes=30):
         await callback.answer(
             "Отменить регистрацию можно не позднее чем за 30 минут до начала кастомки.",
             show_alert=True
@@ -1756,7 +1826,7 @@ async def cmd_history(message: Message):
 
     lines = ["📜 <b>Последние результаты</b>\n"]
     for r in results:
-        event_time = datetime.fromisoformat(r["event_time"])
+        event_time = parse_stored_time(r["event_time"])
         mvp_user = get_user(r["mvp_user_id"]) if r["mvp_user_id"] else None
         mvp_name = mvp_user["nickname"] if mvp_user else "—"
         lines.append(
@@ -1765,58 +1835,112 @@ async def cmd_history(message: Message):
     await message.reply("\n".join(lines), parse_mode="HTML")
 
 
+@router.message(Command("mystats"))
+async def cmd_mystats(message: Message):
+    user = get_user(message.from_user.id)
+    if not user:
+        await message.reply("У тебя ещё нет профиля. Напиши /start, чтобы его создать.")
+        return
+
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("Напиши эту команду прямо в беседе, где проходят кастомки.")
+        return
+
+    stats = get_player_stats(message.chat.id, message.from_user.id)
+    games = stats["games"]
+
+    if games == 0:
+        await message.reply(
+            f"📊 Пока нет завершённых кастомок с твоим участием в этой беседе.\n"
+            f"Сыграй хотя бы одну — и тут появится статистика!"
+        )
+        return
+
+    winrate = round(stats["wins"] / games * 100)
+    await message.reply(
+        f"📊 <b>Твоя статистика в этой беседе</b>\n\n"
+        f"🎮 Игр сыграно: {games}\n"
+        f"🏆 Побед: {stats['wins']} ({winrate}%)\n"
+        f"⭐ MVP: {stats['mvps']}",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("leaderboard"))
+async def cmd_leaderboard(message: Message):
+    rows = get_leaderboard(message.chat.id, limit=10)
+    if not rows:
+        await message.reply("Пока нет завершённых кастомок с результатами в этой беседе.")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>Рейтинг беседы</b>\n"]
+    for i, r in enumerate(rows):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        winrate = round(r["wins"] / r["games"] * 100) if r["games"] else 0
+        lines.append(
+            f"{prefix} {r['nickname']} — {r['wins']} побед из {r['games']} ({winrate}%), MVP: {r['mvps']}"
+        )
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
 # ------------------------------ Фоновая проверка времени (напоминания) ------------------------------
 
 async def scheduler_loop():
     while True:
-        now = datetime.now()
+        now = now_msk()
         for custom in get_all_active_customs():
-            event_time = datetime.fromisoformat(custom["event_time"])
-            first_reminder_time = event_time - timedelta(minutes=REMINDER_BEFORE_MINUTES)
-            second_reminder_time = event_time - timedelta(minutes=SECOND_REMINDER_BEFORE_MINUTES)
+            try:
+                event_time = parse_stored_time(custom["event_time"])
+                first_reminder_time = event_time - timedelta(minutes=REMINDER_BEFORE_MINUTES)
+                second_reminder_time = event_time - timedelta(minutes=SECOND_REMINDER_BEFORE_MINUTES)
 
-            # первое напоминание — тегаем всех, даём кнопку "Готов"
-            if not custom["reminder_sent"] and now >= first_reminder_time and now < event_time:
-                players = get_registrations(custom["id"])
-                mentions = " ".join(mention(p) for p in players) if players else "(пока никто не записался)"
-                await bot.send_message(
-                    custom["chat_id"],
-                    f"⏰ До кастомки осталось {REMINDER_BEFORE_MINUTES} минут!\n"
-                    f"Нажмите «Готов», чтобы подтвердить участие:\n\n{mentions}",
-                    parse_mode="HTML",
-                    reply_markup=ready_button(custom["id"])
-                )
-                mark_reminder_sent(custom["id"])
-
-            # второе напоминание — тегаем только тех, кто ещё не подтвердил
-            if not custom["second_reminder_sent"] and now >= second_reminder_time and now < event_time:
-                pending = [p for p in get_registrations(custom["id"]) if p["attendance"] != "ready"]
-                if pending:
-                    mentions = " ".join(mention(p) for p in pending)
+                # первое напоминание — тегаем всех, даём кнопку "Готов"
+                if not custom["reminder_sent"] and now >= first_reminder_time and now < event_time:
+                    players = get_registrations(custom["id"])
+                    mentions = " ".join(mention(p) for p in players) if players else "(пока никто не записался)"
                     await bot.send_message(
                         custom["chat_id"],
-                        f"⏰ Осталось {SECOND_REMINDER_BEFORE_MINUTES} минут! "
-                        f"Вы ещё не подтвердили участие:\n\n{mentions}",
+                        f"⏰ До кастомки осталось {REMINDER_BEFORE_MINUTES} минут!\n"
+                        f"Нажмите «Готов», чтобы подтвердить участие:\n\n{mentions}",
                         parse_mode="HTML",
                         reply_markup=ready_button(custom["id"])
                     )
-                mark_second_reminder_sent(custom["id"])
+                    mark_reminder_sent(custom["id"])
 
-            # старт кастомки
-            if now >= event_time:
-                mark_unconfirmed_as_no_show(custom["id"])
-                players = get_registrations(custom["id"])
-                ready_players = [p for p in players if p["attendance"] == "ready"]
-                no_show_players = [p for p in players if p["attendance"] == "no_show"]
+                # второе напоминание — тегаем только тех, кто ещё не подтвердил
+                if not custom["second_reminder_sent"] and now >= second_reminder_time and now < event_time:
+                    pending = [p for p in get_registrations(custom["id"]) if p["attendance"] != "ready"]
+                    if pending:
+                        mentions = " ".join(mention(p) for p in pending)
+                        await bot.send_message(
+                            custom["chat_id"],
+                            f"⏰ Осталось {SECOND_REMINDER_BEFORE_MINUTES} минут! "
+                            f"Вы ещё не подтвердили участие:\n\n{mentions}",
+                            parse_mode="HTML",
+                            reply_markup=ready_button(custom["id"])
+                        )
+                    mark_second_reminder_sent(custom["id"])
 
-                mentions = " ".join(mention(p) for p in ready_players) if ready_players else "(никто не подтвердил участие)"
-                text = f"🚨 Кастомка начинается прямо сейчас!\n\n{mentions}"
-                if no_show_players:
-                    names = ", ".join(p["nickname"] for p in no_show_players)
-                    text += f"\n\n❌ Не подтвердили участие: {names}"
+                # старт кастомки
+                if now >= event_time:
+                    mark_unconfirmed_as_no_show(custom["id"])
+                    players = get_registrations(custom["id"])
+                    ready_players = [p for p in players if p["attendance"] == "ready"]
+                    no_show_players = [p for p in players if p["attendance"] == "no_show"]
 
-                await bot.send_message(custom["chat_id"], text, parse_mode="HTML")
-                finish_custom(custom["id"])
+                    mentions = " ".join(mention(p) for p in ready_players) if ready_players else "(никто не подтвердил участие)"
+                    text = f"🚨 Кастомка начинается прямо сейчас!\n\n{mentions}"
+                    if no_show_players:
+                        names = ", ".join(p["nickname"] for p in no_show_players)
+                        text += f"\n\n❌ Не подтвердили участие: {names}"
+
+                    await bot.send_message(custom["chat_id"], text, parse_mode="HTML")
+                    finish_custom(custom["id"])
+            except Exception as e:
+                # Не даём одной ошибке (например, недоступной беседе или сбое сети)
+                # остановить проверку остальных кастомок и все будущие напоминания
+                print(f"[scheduler_loop] Ошибка при обработке кастомки {custom['id']}: {e}")
 
         await asyncio.sleep(30)  # проверка каждые 30 секунд
 
