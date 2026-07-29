@@ -314,14 +314,16 @@ def init_db():
             team_number INTEGER,
             team_role TEXT,
             attendance TEXT,
+            registered_at TEXT,
             PRIMARY KEY (custom_id, user_id)
         )
     """)
-    # Миграция: если база создавалась раньше (без колонки team_number/attendance/team_role), добавляем их
+    # Миграция: если база создавалась раньше (без колонки team_number/attendance/team_role/registered_at), добавляем их
     for column_sql in [
         "ALTER TABLE registrations ADD COLUMN team_number INTEGER",
         "ALTER TABLE registrations ADD COLUMN attendance TEXT",
         "ALTER TABLE registrations ADD COLUMN team_role TEXT",
+        "ALTER TABLE registrations ADD COLUMN registered_at TEXT",
     ]:
         try:
             cur.execute(column_sql)
@@ -451,8 +453,8 @@ def register_to_custom(custom_id: int, user_id: int) -> bool:
     conn = db()
     try:
         conn.execute(
-            "INSERT INTO registrations (custom_id, user_id) VALUES (?, ?)",
-            (custom_id, user_id)
+            "INSERT INTO registrations (custom_id, user_id, registered_at) VALUES (?, ?, ?)",
+            (custom_id, user_id, now_msk().isoformat())
         )
         conn.commit()
         return True
@@ -485,7 +487,7 @@ def unregister_from_custom(custom_id: int, user_id: int):
 def get_registrations(custom_id: int):
     conn = db()
     rows = conn.execute("""
-        SELECT u.*, r.team_number, r.team_role, r.attendance FROM registrations r
+        SELECT u.*, r.team_number, r.team_role, r.attendance, r.registered_at FROM registrations r
         JOIN users u ON u.user_id = r.user_id
         WHERE r.custom_id = ?
     """, (custom_id,)).fetchall()
@@ -960,6 +962,58 @@ def make_teams(custom_id: int, num_teams: int = None) -> int:
     return num_teams
 
 
+def fill_vacancies(custom_id: int):
+    """
+    Лист ожидания: если в уже сформированных командах не хватает какой-то
+    роли (например, кто-то отменил регистрацию или его удалили), пробуем
+    закрыть её тем, кто дольше всех ждёт в запасных с такой же ролью
+    (основной или второй). Генералисты тоже подходят, но только если нет
+    точного совпадения по роли. Если подходящего кандидата нет вообще —
+    место остаётся пустым, никого "не своей" роли туда не ставим.
+
+    Возвращает список (игрок, номер_команды, роль) по каждому, кого
+    получилось так подключить — используется, чтобы объявить об этом в беседе.
+    """
+    teams, substitutes = get_teams_grouped(custom_id)
+    if not teams:
+        return []
+
+    def registered_key(p):
+        return p["registered_at"] or ""  # раньше зарегистрированные — раньше в очереди
+
+    core_roles = [r for r in ROLES if r != "Генералист"]
+    promoted = []
+    remaining_substitutes = list(substitutes)
+
+    for team_number in sorted(teams.keys()):
+        filled_roles = {p["team_role"] for p in teams[team_number]}
+        missing_roles = [r for r in core_roles if r not in filled_roles]
+
+        for role in missing_roles:
+            exact = sorted(
+                [p for p in remaining_substitutes if p["role1"] == role or p["role2"] == role],
+                key=registered_key
+            )
+            if exact:
+                chosen = exact[0]
+            else:
+                generalists = sorted(
+                    [p for p in remaining_substitutes
+                     if p["role1"] == "Генералист" or p["role2"] == "Генералист"],
+                    key=registered_key
+                )
+                chosen = generalists[0] if generalists else None
+
+            if chosen is None:
+                continue  # некем закрыть — место остаётся вакантным
+
+            set_team_number(custom_id, chosen["user_id"], team_number, team_role=role)
+            remaining_substitutes.remove(chosen)
+            promoted.append((chosen, team_number, role))
+
+    return promoted
+
+
 # ------------------------------ FSM состояния ------------------------------
 
 class Registration(StatesGroup):
@@ -1123,7 +1177,7 @@ def render_teams_text(custom_id: int) -> str:
             lines.append(f"• {p['nickname']} — {role_shown} — {p['rank']}")
 
     if substitutes:
-        lines.append("\n<b>Запасные</b>")
+        lines.append("\n<b>🕐 Лист ожидания</b>")
         for p in substitutes:
             lines.append(f"• {p['nickname']} — {p['role1']}/{p['role2']} — {p['rank']}")
 
@@ -1802,6 +1856,9 @@ async def cb_remove_player(callback: CallbackQuery):
     await callback.message.edit_text(f"{name} удалён(а) из списка зарегистрированных ❌")
     await callback.answer("Готово")
 
+    promoted = fill_vacancies(custom_id)
+    await announce_promotions(callback.message.chat.id, custom_id, promoted)
+
 
 # ------------------------------ Формирование команд (только админы) ------------------------------
 
@@ -1972,6 +2029,20 @@ async def cb_teams_cancel(callback: CallbackQuery):
 
 # ------------------------------ Регистрация на кастомку (кнопка) ------------------------------
 
+async def announce_promotions(chat_id: int, custom_id: int, promoted: list):
+    """Сообщает в беседу, если кого-то из листа ожидания автоматически
+    подключили к команде на освободившееся место."""
+    if not promoted:
+        return
+    lines = []
+    for player, team_number, role in promoted:
+        team_name = get_team_display_name(custom_id, team_number)
+        lines.append(
+            f"🔁 {mention(player)} подключён(а) к «{team_name}» на роль {role} — место освободилось."
+        )
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
 @router.callback_query(F.data.startswith("reg:"))
 async def cb_register(callback: CallbackQuery):
     custom_id = int(callback.data.split(":", 1)[1])
@@ -1987,6 +2058,8 @@ async def cb_register(callback: CallbackQuery):
     added = register_to_custom(custom_id, callback.from_user.id)
     if added:
         await callback.answer("Ты зарегистрирован(а)✅", show_alert=True)
+        promoted = fill_vacancies(custom_id)
+        await announce_promotions(callback.message.chat.id, custom_id, promoted)
     else:
         await callback.answer("Ты уже зарегистрирован(а)", show_alert=True)
 
@@ -2014,6 +2087,8 @@ async def cb_unregister(callback: CallbackQuery):
 
     unregister_from_custom(custom_id, callback.from_user.id)
     await callback.answer("Регистрация отменена ❌", show_alert=True)
+    promoted = fill_vacancies(custom_id)
+    await announce_promotions(callback.message.chat.id, custom_id, promoted)
 
 
 # ------------------------------ Подтверждение готовности ("Готов") ------------------------------
