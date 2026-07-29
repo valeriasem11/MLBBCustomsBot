@@ -187,6 +187,7 @@ ADMIN_COMMANDS = PLAYER_COMMANDS + [
     BotCommand(command="removebotadmin", description="Убрать админа бота (Reply, только создатель)"),
     BotCommand(command="listbotadmins", description="Кто может управлять ботом"),
     BotCommand(command="resetbotadmins", description="Сбросить список админов бота"),
+    BotCommand(command="resetstats", description="Очистить статистику и историю (только создатель)"),
 ]
 
 # ------------------------------ Автообновление меню команд ------------------------------
@@ -558,6 +559,32 @@ def get_results_history(chat_id: int, limit: int = 5):
     ).fetchall()
     conn.close()
     return rows
+
+
+def count_finished_customs(chat_id: int) -> int:
+    conn = db()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM customs WHERE chat_id = ? AND status = 'finished'",
+        (chat_id,)
+    ).fetchone()
+    conn.close()
+    return row["c"]
+
+
+def reset_chat_stats(chat_id: int):
+    """
+    Полностью удаляет завершённые кастомки этой беседы (и их регистрации) —
+    то есть всё, из чего считаются /mystats, /leaderboard и /history.
+    Активную (если есть) и отменённые кастомки не трогает.
+    """
+    conn = db()
+    conn.execute("""
+        DELETE FROM registrations
+        WHERE custom_id IN (SELECT id FROM customs WHERE chat_id = ? AND status = 'finished')
+    """, (chat_id,))
+    conn.execute("DELETE FROM customs WHERE chat_id = ? AND status = 'finished'", (chat_id,))
+    conn.commit()
+    conn.close()
 
 
 # ------------------------------ Статистика и рейтинг ------------------------------
@@ -1882,6 +1909,54 @@ async def cmd_leaderboard(message: Message):
             f"{prefix} {r['nickname']} — {r['wins']} побед из {r['games']} ({winrate}%), MVP: {r['mvps']}"
         )
     await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("resetstats"))
+async def cmd_reset_stats(message: Message):
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("Эту команду нужно использовать прямо в беседе.")
+        return
+
+    if not await is_chat_creator(message.from_user.id, message.chat.id):
+        await message.reply(
+            "Очищать статистику и историю может только создатель этой беседы "
+            "(или супер-админ бота) — действие необратимо."
+        )
+        return
+
+    count = count_finished_customs(message.chat.id)
+    if count == 0:
+        await message.reply("В этой беседе пока нет сохранённой статистики или истории — нечего очищать.")
+        return
+
+    await message.reply(
+        f"⚠️ Это удалит статистику, рейтинг и историю по {count} завершённ"
+        f"{'ой кастомке' if count == 1 else 'ым кастомкам'} в этой беседе. "
+        f"Отменить это будет нельзя.\n\nТочно очистить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Да, очистить", callback_data="resetstats:confirm"),
+            InlineKeyboardButton(text="Отмена", callback_data="resetstats:cancel"),
+        ]])
+    )
+
+
+@router.callback_query(F.data.startswith("resetstats:"))
+async def cb_reset_stats(callback: CallbackQuery):
+    if not await is_chat_creator(callback.from_user.id, callback.message.chat.id):
+        await callback.answer("Только создатель беседы может это подтвердить.", show_alert=True)
+        return
+
+    if callback.data == "resetstats:cancel":
+        await callback.message.edit_text("Отменено, ничего не удалено.")
+        await callback.answer()
+        return
+
+    reset_chat_stats(callback.message.chat.id)
+    await callback.message.edit_text(
+        "Готово ✅ Статистика, рейтинг и история кастомок в этой беседе очищены.\n\n"
+        "Активная кастомка (если была) не затронута."
+    )
+    await callback.answer("Очищено")
 
 
 # ------------------------------ Фоновая проверка времени (напоминания) ------------------------------
