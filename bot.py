@@ -36,6 +36,7 @@ from aiogram.types import (
     BotCommandScopeChatAdministrators,
     BotCommandScopeDefault,
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -464,6 +465,10 @@ async def _ensure_chat_menu_configured(chat):
         await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChatAdministrators(chat_id=chat.id))
     except Exception:
         pass
+    try:
+        upsert_bot_chat(chat.id, chat.title or str(chat.id), chat.type, "member")
+    except Exception:
+        pass
 
 
 async def _auto_commands_middleware(handler, event, data):
@@ -488,6 +493,22 @@ async def _auto_commands_middleware(handler, event, data):
 
 router.message.middleware(_auto_commands_middleware)
 router.callback_query.middleware(_auto_commands_middleware)
+
+
+@router.my_chat_member()
+async def on_bot_membership_changed(event: ChatMemberUpdated):
+    """
+    Срабатывает каждый раз, когда меняется статус самого бота в беседе —
+    его добавили, удалили, повысили до админа и т.п. Это единственный
+    штатный способ в Telegram узнать, в каких беседах сейчас состоит бот.
+    """
+    chat = event.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    try:
+        upsert_bot_chat(chat.id, chat.title or str(chat.id), chat.type, event.new_chat_member.status)
+    except Exception:
+        pass
 
 
 # ------------------------------ БАЗА ДАННЫХ ------------------------------
@@ -584,6 +605,15 @@ def init_db():
             time TEXT,
             created_by INTEGER,
             last_triggered_date TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_chats (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            type TEXT,
+            status TEXT,
+            last_seen TEXT
         )
     """)
     conn.commit()
@@ -885,6 +915,30 @@ def mark_schedule_triggered(schedule_id: int, date_str: str):
     conn.execute("UPDATE schedules SET last_triggered_date = ? WHERE id = ?", (date_str, schedule_id))
     conn.commit()
     conn.close()
+
+
+# ------------------------------ Список беседы, где состоит бот ------------------------------
+
+def upsert_bot_chat(chat_id: int, title: str, chat_type: str, status: str):
+    conn = db()
+    conn.execute("""
+        INSERT INTO bot_chats (chat_id, title, type, status, last_seen)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            title = excluded.title,
+            type = excluded.type,
+            status = excluded.status,
+            last_seen = excluded.last_seen
+    """, (chat_id, title, chat_type, status, now_msk().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_all_bot_chats():
+    conn = db()
+    rows = conn.execute("SELECT * FROM bot_chats ORDER BY last_seen DESC").fetchall()
+    conn.close()
+    return rows
 
 
 def get_results_history(chat_id: int, limit: int = 5):
@@ -1799,6 +1853,31 @@ async def cmd_reset_bot_admins(message: Message):
         "Теперь снова любой реальный администратор этой беседы в Telegram "
         "может управлять кастомками."
     )
+
+
+@router.message(Command("mychats"))
+async def cmd_my_chats(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.reply("Эта команда доступна только супер-админу бота.")
+        return
+
+    chats = get_all_bot_chats()
+    if not chats:
+        await message.reply(
+            "Пока нет данных ни об одной беседе — они появятся сами, "
+            "как только кто-нибудь напишет что-то в беседе с ботом."
+        )
+        return
+
+    lines = [f"🤖 <b>Беседы, где известен бот</b> ({len(chats)})\n"]
+    for c in chats:
+        last_seen = parse_stored_time(c["last_seen"]).strftime("%d.%m.%Y %H:%M")
+        status_icon = "✅" if c["status"] in ("member", "administrator", "creator") else "❌"
+        lines.append(
+            f"{status_icon} {c['title']}\n"
+            f"    ID: <code>{c['chat_id']}</code> · статус: {c['status']} · обновлено: {last_seen}"
+        )
+    await message.reply("\n".join(lines), parse_mode="HTML")
 
 
 # ------------------------------ Создание кастомки (только админы) ------------------------------
